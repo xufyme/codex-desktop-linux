@@ -1,0 +1,288 @@
+name: Codex Desktop Linux Release
+
+# Builds this fork's Codex Desktop Debian package from upstream's current tip.
+#
+# Design note: this workflow never pushes to the fork. The previous version
+# merged upstream into the fork's main and pushed the result, which GITHUB_TOKEN
+# is not allowed to do once the merge touches .github/workflows/** — every run
+# failed at that step from 2026-08-15 on. Instead upstream is checked out fresh
+# on every run, so there is nothing to merge, conflict, or push.
+#
+# The fork's main therefore only has to carry two files:
+#   .github/linux-features.json          — which Linux features to build in
+#   .github/workflows/linux-release.yml  — this file
+
+on:
+  schedule:
+    # 09:17 UTC = 17:17 Asia/Shanghai — well before the laptop's 20:00 check.
+    - cron: "17 9 * * *"
+    # 21:17 UTC = 05:17 Asia/Shanghai — retry window if the daytime run failed.
+    - cron: "17 21 * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild even when this candidate already has a release
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/linux-release.yml"
+      - ".github/linux-features.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-desktop-linux-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build from upstream tip and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the fork's build configuration
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: fork
+
+      - name: Check out upstream at its current tip
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: ilysenko/codex-desktop-linux
+          ref: main
+          path: src
+
+      - name: Identify the sources this build is made of
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_commit="$(git -C src rev-parse HEAD)"
+          features_sha256="$(sha256sum fork/.github/linux-features.json | cut -d' ' -f1)"
+          recipe_sha256="$(sha256sum fork/.github/workflows/linux-release.yml | cut -d' ' -f1)"
+          {
+            echo "upstream_commit=$upstream_commit"
+            echo "features_sha256=$features_sha256"
+            echo "recipe_sha256=$recipe_sha256"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream tip: $upstream_commit"
+          echo "Enabled features:"
+          jq -r '.enabled[]' fork/.github/linux-features.json | sed 's/^/  - /'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev gnupg patchelf make g++ python3 curl jq
+
+      # Resolve the signed package index only. This costs a few hundred KiB and
+      # tells us the official version and SHA-256, which is everything the
+      # skip decision below needs — the 270+ MiB package is fetched only if a
+      # build is actually going to happen.
+      - name: Resolve the official signed Linux package metadata
+        id: official
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          node scripts/lib/upstream-linux-package.js \
+            --output-dir upstream/amd64 \
+            --metadata upstream/amd64.json \
+            --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
+            --arch amd64 \
+            --metadata-only
+          {
+            echo "version=$(jq -er '.version' upstream/amd64.json)"
+            echo "sha256=$(jq -er '.sha256' upstream/amd64.json)"
+            echo "repository_path=$(jq -er '.repositoryPath' upstream/amd64.json)"
+          } >> "$GITHUB_OUTPUT"
+          jq -r '"Official package: \(.version) (\(.sha256))"' upstream/amd64.json
+
+      - name: Decide whether anything actually changed
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_key="upstream=${{ steps.source.outputs.upstream_commit }};official=${{ steps.official.outputs.sha256 }};features=${{ steps.source.outputs.features_sha256 }};recipe=${{ steps.source.outputs.recipe_sha256 }}"
+          echo "candidate_key=$candidate_key" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=" >> "$GITHUB_OUTPUT"
+            echo "Forced rebuild requested."
+            exit 0
+          fi
+          # gh api --jq takes no jq --arg, so pipe the raw JSON into jq instead.
+          existing_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" 2>/dev/null \
+            | jq -r --arg key "$candidate_key" \
+              '.[] | select(.draft == false and .prerelease == false)
+               | select((.body // "") | contains("Candidate-Key: " + $key)) | .tag_name' \
+            | head -n1 || true)"
+          if [ -n "$existing_tag" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=$existing_tag" >> "$GITHUB_OUTPUT"
+            echo "Nothing changed since $existing_tag; skipping the build."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=" >> "$GITHUB_OUTPUT"
+            echo "New candidate; building."
+          fi
+
+      - name: Download and verify the official signed Linux package
+        id: package
+        if: steps.candidate.outputs.build == 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(node scripts/lib/upstream-linux-package.js \
+            --output-dir upstream/amd64 \
+            --metadata upstream/amd64.json \
+            --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
+            --arch amd64)"
+          test -s "$package"
+          # The signed index was already read once; make sure the package that
+          # the skip decision was based on is the one we actually build from.
+          test "$(jq -er '.sha256' upstream/amd64.json)" = "${{ steps.official.outputs.sha256 }}"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Build the app from the official package with this fork's features
+        if: steps.candidate.outputs.build == 'true'
+        working-directory: src
+        env:
+          CODEX_LINUX_FEATURES_CONFIG: ${{ github.workspace }}/fork/.github/linux-features.json
+          CODEX_PATCH_REPORT_JSON: ${{ github.workspace }}/src/patch-report.json
+        run: ./install.sh "${{ steps.package.outputs.package }}"
+
+      - name: Validate the patch report and wrapper scripts
+        if: steps.candidate.outputs.build == 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/ci/validate-patch-report.js patch-report.json --profile upstream-build
+          bash -n install.sh scripts/build-deb.sh
+          node --test scripts/patch-linux-window-ui.test.js
+
+      - name: Build the Debian package without the resident updater
+        id: deb
+        if: steps.candidate.outputs.build == 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_WITH_UPDATER=0 MAX_BUILD_THREADS=8 make deb
+          deb_path="$(find dist -maxdepth 1 -type f -name 'codex-desktop_*_amd64.deb' \
+            -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {sub(/^[^ ]+ /,""); print}')"
+          test -n "$deb_path"
+          deb_name="$(basename "$deb_path")"
+          package_version="$(dpkg-deb -f "$deb_path" Version)"
+          deb_sha256="$(sha256sum "$deb_path" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$deb_sha256" "$deb_name" > SHA256SUMS
+          cp upstream/amd64.json upstream-deb-metadata.json
+          jq -n \
+            --arg package_version "$package_version" \
+            --arg deb_name "$deb_name" \
+            --arg deb_sha256 "$deb_sha256" \
+            --arg source_commit "${{ steps.source.outputs.upstream_commit }}" \
+            --arg upstream_commit "${{ steps.source.outputs.upstream_commit }}" \
+            --arg fork_commit "$GITHUB_SHA" \
+            --arg official_version "${{ steps.official.outputs.version }}" \
+            --arg official_repository_path "${{ steps.official.outputs.repository_path }}" \
+            --arg official_deb_sha256 "${{ steps.official.outputs.sha256 }}" \
+            --arg built_at_utc "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            '{package_version:$package_version,deb_name:$deb_name,deb_sha256:$deb_sha256,
+              source_commit:$source_commit,upstream_commit:$upstream_commit,fork_commit:$fork_commit,
+              official_version:$official_version,official_repository_path:$official_repository_path,
+              official_deb_sha256:$official_deb_sha256,built_at_utc:$built_at_utc,
+              package_with_updater:false}' \
+            > build-metadata.json
+          {
+            echo "deb_path=$deb_path"
+            echo "deb_name=$deb_name"
+            echo "package_version=$package_version"
+            echo "deb_sha256=$deb_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        id: release
+        if: steps.candidate.outputs.build == 'true'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="linux-${{ steps.deb.outputs.package_version }}-${{ steps.official.outputs.sha256 }}"
+          {
+            echo "Automated build from the official signed Linux package, with this fork's features."
+            echo ""
+            echo "Candidate-Key: ${{ steps.candidate.outputs.candidate_key }}"
+            echo ""
+            echo "- Official package version: ${{ steps.official.outputs.version }}"
+            echo "- Official package SHA-256: ${{ steps.official.outputs.sha256 }}"
+            echo "- Official repository path: ${{ steps.official.outputs.repository_path }}"
+            echo "- Upstream commit: ${{ steps.source.outputs.upstream_commit }}"
+            echo "- Fork commit: $GITHUB_SHA"
+            echo "- Debian package SHA-256: ${{ steps.deb.outputs.deb_sha256 }}"
+            echo ""
+            echo "Built without codex-update-manager; the host updater installs it."
+          } > release-notes.md
+          assets=("${{ steps.deb.outputs.deb_path }}" SHA256SUMS upstream-deb-metadata.json build-metadata.json)
+          [ -s patch-report.json ] && assets+=(patch-report.json)
+          gh release create "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Codex Desktop Linux ${{ steps.deb.outputs.package_version }}" \
+            --notes-file release-notes.md
+          gh release upload "$release_tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      # Each package is ~270 MiB, so keep only a short rollback history.
+      - name: Prune all but the five newest releases
+        if: steps.candidate.outputs.build == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq 'map(select(.draft == false and (.tag_name | startswith("linux-"))))
+                  | sort_by(.published_at) | reverse | .[5:] | .[].tag_name' \
+            | while read -r tag; do
+                [ -n "$tag" ] || continue
+                echo "Deleting old release $tag"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              done
+
+      - name: Write the run summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Codex Desktop Linux Release"
+            echo ""
+            echo "- Upstream commit: \`${{ steps.source.outputs.upstream_commit }}\`"
+            echo "- Official package: ${{ steps.official.outputs.version }} (\`${{ steps.official.outputs.sha256 }}\`)"
+            if [ "${{ steps.candidate.outputs.build }}" = "true" ]; then
+              echo "- Release: \`${{ steps.release.outputs.release_tag }}\`"
+              echo "- Package: \`${{ steps.deb.outputs.deb_name }}\`"
+              echo "- Debian SHA-256: \`${{ steps.deb.outputs.deb_sha256 }}\`"
+            else
+              echo "- Build skipped: nothing changed since \`${{ steps.candidate.outputs.existing_tag }}\`"
+            fi
+            echo "- Schedule: 09:17 / 21:17 UTC (17:17 / 05:17 Asia/Shanghai)"
+          } >> "$GITHUB_STEP_SUMMARY"
