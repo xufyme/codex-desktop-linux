@@ -13,22 +13,12 @@ name: Codex Desktop Linux Release
 #   .github/workflows/linux-release.yml  — this file
 
 on:
-  schedule:
-    # 09:17 UTC = 17:17 Asia/Shanghai — well before the laptop's 20:00 check.
-    - cron: "17 9 * * *"
-    # 21:17 UTC = 05:17 Asia/Shanghai — retry window if the daytime run failed.
-    - cron: "17 21 * * *"
   workflow_dispatch:
     inputs:
       force_rebuild:
         description: Rebuild even when this candidate already has a release
         type: boolean
         default: false
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/linux-release.yml"
-      - ".github/linux-features.json"
 
 permissions:
   contents: write
@@ -290,5 +280,5 @@ jobs:
             else
               echo "- Build skipped: nothing changed since \`${{ steps.candidate.outputs.existing_tag }}\`"
             fi
-            echo "- Schedule: 09:17 / 21:17 UTC (17:17 / 05:17 Asia/Shanghai)"
+            echo "- Automatic builds disabled; manual dispatch only."
           } >> "$GITHUB_STEP_SUMMARY"
